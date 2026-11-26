@@ -29,6 +29,11 @@ class SchemaError(ValueError):
 
 
 REJECT_COLUMNS = [S.SOURCE, S.ROW_ID, "reason", "raw_record"]
+FILE_CHECK_COLUMNS = ["file", "rows", "malformed", "malformed_pct", "status"]
+FILE_ACCEPTED, FILE_REJECTED = "Accepted", "Rejected"
+# Preventive control: a file with more malformed rows than this is rejected
+# whole - a broken extract shouldn't be half-loaded into analytics.
+DEFAULT_MAX_MALFORMED_PCT = 1.0
 
 
 @dataclass
@@ -38,6 +43,10 @@ class IngestResult:
         default_factory=lambda: pd.DataFrame(columns=REJECT_COLUMNS)
     )
     files: List[str] = field(default_factory=list)
+    # One row per input file: the file-level control (preventive).
+    file_checks: pd.DataFrame = field(
+        default_factory=lambda: pd.DataFrame(columns=FILE_CHECK_COLUMNS)
+    )
 
     @property
     def total_rows(self) -> int:
@@ -169,19 +178,44 @@ def normalise(raw: pd.DataFrame, source_name: str = "<memory>") -> IngestResult:
     return IngestResult(data=clean, rejected=rejected, files=[os.path.basename(source_name)])
 
 
-def ingest(sources: Iterable, filenames: Iterable[str] = None) -> IngestResult:
-    """Ingest one or more files (paths or uploaded file objects)."""
+def ingest(sources: Iterable, filenames: Iterable[str] = None,
+           max_malformed_pct: float = DEFAULT_MAX_MALFORMED_PCT) -> IngestResult:
+    """Ingest one or more files (paths or uploaded file objects).
+
+    File-level control: if more than ``max_malformed_pct`` % of a file's rows
+    are malformed, the whole file is rejected. Its parsed rows are moved to
+    quarantine with reason FILE_REJECTED, so record accounting still balances.
+    """
     sources = list(sources)
     filenames = list(filenames) if filenames is not None else [None] * len(sources)
-    frames, rejects, files = [], [], []
+    frames, rejects, files, checks = [], [], [], []
     for src, fname in zip(sources, filenames):
         name = fname or getattr(src, "name", None) or str(src)
-        result = normalise(read_raw(src, name), name)
-        frames.append(result.data)
-        rejects.append(result.rejected)
+        raw = read_raw(src, name)
+        result = normalise(raw, name)
+        n = len(raw)
+        bad = len(result.rejected)
+        pct = 100.0 * bad / n if n else 0.0
+        status = FILE_REJECTED if pct > max_malformed_pct else FILE_ACCEPTED
+        checks.append({"file": os.path.basename(name), "rows": n, "malformed": bad,
+                       "malformed_pct": round(pct, 3), "status": status})
+        if status == FILE_REJECTED and not result.data.empty:
+            moved = pd.DataFrame({
+                S.SOURCE: result.data[S.SOURCE].values,
+                S.ROW_ID: result.data[S.ROW_ID].values,
+                "reason": f"FILE_REJECTED ({pct:.1f}% malformed > {max_malformed_pct:g}%)",
+                "raw_record": raw.iloc[result.data[S.ROW_ID].values - 1].astype(str).agg(" | ".join, axis=1).values,
+            })
+            rejects += [result.rejected, moved]
+            frames.append(result.data.iloc[0:0])
+        else:
+            frames.append(result.data)
+            rejects.append(result.rejected)
         files += result.files
     if not frames:
         raise ValueError("No input files provided")
     data = pd.concat(frames, ignore_index=True)
     rejected = pd.concat(rejects, ignore_index=True) if rejects else pd.DataFrame(columns=REJECT_COLUMNS)
-    return IngestResult(data=data, rejected=rejected, files=files)
+    rejected = rejected.sort_values([S.SOURCE, S.ROW_ID]).reset_index(drop=True) if not rejected.empty else rejected
+    return IngestResult(data=data, rejected=rejected, files=files,
+                        file_checks=pd.DataFrame(checks, columns=FILE_CHECK_COLUMNS))

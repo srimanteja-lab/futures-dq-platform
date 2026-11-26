@@ -19,15 +19,21 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
+from . import exchange_calendar as XC
 from . import schema as S
 
 ERROR, WARNING, INFO = "ERROR", "WARNING", "INFO"
+
+# Publication-gate verdicts (plain English for traders / risk).
+TRUSTED, CAUTION, BLOCKED = "Trusted", "Use with caution", "Blocked"
 ISSUE_COLUMNS = [
     "rule_id", "category", "severity", S.CONTRACT, S.TIMESTAMP,
     S.SOURCE, S.ROW_ID, "detail",
 ]
 
 MINUTES_PER_WEEK = 7 * 24 * 60
+# Longest gap a scheduled closure can explain (e.g. Thu 12:00 -> Sun 17:00).
+MAX_CLOSURE_SPAN = pd.Timedelta(days=4)
 BUCKET_MINUTES = 15
 _MONDAY_EPOCH = pd.Timestamp("1970-01-05")  # a Monday
 
@@ -49,6 +55,11 @@ class QualityConfig:
     allow_negative_prices: bool = False
     # Anything later than "now" is impossible for historical data.
     max_timestamp: Optional[pd.Timestamp] = None
+    # Gaps that overlap an exchange holiday / early close are scheduled, not defects.
+    use_holiday_calendar: bool = True
+    # Publication gate (business-owned thresholds, in %).
+    gate_min_validity: float = 99.0       # below -> Blocked
+    gate_min_completeness: float = 95.0   # below -> Use with caution
 
 
 def _issues(df: pd.DataFrame, mask, rule: "Rule", detail, severity=None) -> pd.DataFrame:
@@ -287,21 +298,38 @@ class GapRule(Rule):
             exp = expected[flag]
             first_rows = g.drop_duplicates(S.TIMESTAMP).set_index(S.TIMESTAMP)
             nxt = first_rows.loc[next_ts]
+            # Scheduled closures (holidays / early closes) are not data defects.
+            # Only short gaps can be explained by a closure: a gap spanning
+            # months that happens to contain a holiday is still a real gap.
+            closures = [
+                XC.closure_between(pd.Timestamp(a), pd.Timestamp(b))
+                if cfg.use_holiday_calendar and pd.Timestamp(b) - pd.Timestamp(a) <= MAX_CLOSURE_SPAN
+                else None
+                for a, b in zip(prev_ts, next_ts)
+            ]
+            rule_ids, sevs, details = [], [], []
+            for a, b, e, c in zip(prev_ts, next_ts, exp, closures):
+                window = (f"no bars {pd.Timestamp(a):%Y-%m-%d %H:%M} -> {pd.Timestamp(b):%Y-%m-%d %H:%M} "
+                          f"({int(e)} in-session minutes")
+                if c:
+                    rule_ids.append(ScheduledClosureRule.rule_id)
+                    sevs.append(INFO)
+                    details.append(f"{window}; {c[1]} {c[0]:%d %b} ({c[2]}), not a data issue)")
+                else:
+                    rule_ids.append(self.rule_id)
+                    sevs.append(self.severity)
+                    details.append(f"{window} missing; {source} session)")
             out.append(
                 pd.DataFrame(
                     {
-                        "rule_id": self.rule_id,
+                        "rule_id": rule_ids,
                         "category": self.category,
-                        "severity": self.severity,
+                        "severity": sevs,
                         S.CONTRACT: contract,
                         S.TIMESTAMP: pd.to_datetime(prev_ts) + pd.Timedelta(minutes=1),
                         S.SOURCE: nxt[S.SOURCE].to_numpy() if S.SOURCE in nxt else None,
                         S.ROW_ID: nxt[S.ROW_ID].to_numpy() if S.ROW_ID in nxt else None,
-                        "detail": [
-                            f"no bars {pd.Timestamp(a):%Y-%m-%d %H:%M} -> {pd.Timestamp(b):%Y-%m-%d %H:%M} "
-                            f"({int(e)} in-session minutes missing; {source} session)"
-                            for a, b, e in zip(prev_ts, next_ts, exp)
-                        ],
+                        "detail": details,
                         "gap_minutes": exp.astype(int),
                     }
                 )
@@ -309,6 +337,17 @@ class GapRule(Rule):
         if not out:
             return pd.DataFrame(columns=ISSUE_COLUMNS + ["gap_minutes"])
         return pd.concat(out, ignore_index=True)
+
+
+class ScheduledClosureRule(Rule):
+    """Not run on its own: GapRule emits it for gaps that overlap an exchange
+    holiday or early close. Listed so it appears in the rule catalogue."""
+    rule_id, category, severity = "SCHEDULED_CLOSURE", "Completeness", INFO
+    description = ("Gap that overlaps an exchange holiday or early close "
+                   "(e.g. Thanksgiving). Reported for transparency, not a defect.")
+
+    def check(self, df, cfg):
+        return pd.DataFrame(columns=ISSUE_COLUMNS)
 
 
 # ---------------------------------------------------------------- consistency
@@ -374,7 +413,7 @@ DEFAULT_RULES: List[Rule] = [
 
 
 def rule_catalogue(rules: List[Rule] = None) -> pd.DataFrame:
-    rules = rules or DEFAULT_RULES
+    rules = rules or DEFAULT_RULES + [ScheduledClosureRule()]
     return pd.DataFrame(
         [
             {"rule_id": r.rule_id, "category": r.category,
@@ -418,7 +457,28 @@ def rejected_to_issues(rejected: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def _scorecard(df: pd.DataFrame, issues: pd.DataFrame, clean: pd.DataFrame) -> pd.DataFrame:
+def _verdict(row, cfg: QualityConfig):
+    """Publication gate: plain-English verdict plus the reasons behind it."""
+    reasons = []
+    if row["validity_pct"] < cfg.gate_min_validity:
+        reasons.append(f"validity {row['validity_pct']:.2f}% < {cfg.gate_min_validity:g}%")
+    if row["completeness_pct"] < cfg.gate_min_completeness:
+        reasons.append(f"completeness {row['completeness_pct']:.1f}% < {cfg.gate_min_completeness:g}%")
+    if row["validity_pct"] < cfg.gate_min_validity:
+        return BLOCKED, "; ".join(reasons)
+    if reasons:
+        return CAUTION, "; ".join(reasons)
+    extra = []
+    if row["error_records"]:
+        extra.append(f"{row['error_records']} bad record(s) excluded")
+    if row["warning_records"]:
+        extra.append(f"{row['warning_records']} flagged")
+    return TRUSTED, "passes all gates" + (" (" + ", ".join(extra) + ")" if extra else "")
+
+
+def _scorecard(df: pd.DataFrame, issues: pd.DataFrame, clean: pd.DataFrame,
+               cfg: QualityConfig = None) -> pd.DataFrame:
+    cfg = cfg or QualityConfig()
     total = df.groupby(S.CONTRACT).size().rename("records")
     kept = clean.groupby(S.CONTRACT).size().rename("clean_records")
     rec_issues = issues[issues[S.ROW_ID].notna() & (issues["rule_id"] != "DATA_GAP")]
@@ -436,10 +496,17 @@ def _scorecard(df: pd.DataFrame, issues: pd.DataFrame, clean: pd.DataFrame) -> p
     for c in ["records", "clean_records", "error_records", "warning_records", "gaps", "gap_minutes"]:
         sc[c] = sc[c].astype(int)
     sc["validity_pct"] = (100 * (1 - sc["error_records"] / sc["records"])).round(2)
-    # Simple weighted score: errors hurt fully, warnings a quarter.
-    sc["dq_score"] = (
-        100 * (1 - (sc["error_records"] + 0.25 * sc["warning_records"]) / sc["records"])
-    ).clip(lower=0).round(1)
+    # Completeness: bars present vs bars expected while the contract normally
+    # trades (present + in-session minutes inside reported gaps). Scheduled
+    # holiday closures are excluded, so they don't count against the feed.
+    sc["completeness_pct"] = (100 * sc["records"] / (sc["records"] + sc["gap_minutes"])).round(1)
+    # Score = record quality (errors hurt fully, warnings a quarter) x completeness.
+    # The original score ignored completeness, so a contract with 135k missing
+    # minutes still scored 100.0 - a trader would over-trust it.
+    record_quality = (1 - (sc["error_records"] + 0.25 * sc["warning_records"]) / sc["records"]).clip(lower=0)
+    sc["dq_score"] = (100 * record_quality * sc["completeness_pct"] / 100).round(1)
+    gate = sc.apply(lambda r: _verdict(r, cfg), axis=1, result_type="expand")
+    sc["verdict"], sc["verdict_reason"] = gate[0], gate[1]
     return sc.reset_index().rename(columns={"index": S.CONTRACT}).sort_values("dq_score")
 
 
@@ -474,4 +541,5 @@ def run_quality(
         issues = issues.assign(_s=issues["severity"].map(sev_order)).sort_values(
             ["_s", "rule_id", S.CONTRACT, S.TIMESTAMP], na_position="last"
         ).drop(columns="_s").reset_index(drop=True)
-    return QualityReport(issues=issues, clean=clean, scorecard=_scorecard(df, issues, clean), config=cfg)
+    return QualityReport(issues=issues, clean=clean,
+                         scorecard=_scorecard(df, issues, clean, cfg), config=cfg)

@@ -1,11 +1,14 @@
 # Futures Market Data Quality & Analytics Platform
 
+> **v2:** reconciliation, controls, holiday calendar, completeness-aware
+> scoring and a redesigned UI. See [CHANGES.md](CHANGES.md).
+
 A business-facing application that ingests historical futures market data
 (CSV or Parquet), **identifies data quality issues**, produces **market
 analytics** (daily OHLCV bars, rolling 15-minute VWAP) and turns findings into
 **insights and suggested controls** for traders, risk managers and analysts.
 
-![layers](https://img.shields.io/badge/tests-49%20passing-brightgreen)
+![layers](https://img.shields.io/badge/tests-62%20passing-brightgreen)
 
 ---
 
@@ -15,8 +18,9 @@ analytics** (daily OHLCV bars, rolling 15-minute VWAP) and turns findings into
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-python scripts/download_data.py        # real minute data from Hugging Face -> data/raw/
+python scripts/download_data.py        # real minute bars, vendor daily bars + manifest from Hugging Face
 python scripts/make_sample_data.py     # demo CSV with known injected defects -> data/sample/
+python scripts/make_recon_copy.py      # demo "downstream copy" with 3 silent differences
 
 streamlit run app/dashboard.py         # UI at http://localhost:8501
 python -m pytest                       # unit + integration tests
@@ -27,6 +31,8 @@ Headless / batch use (no UI):
 ```bash
 PYTHONPATH=src python -m mdq.cli data/sample/dirty_futures_sample.csv --out reports/demo
 PYTHONPATH=src python -m mdq.cli data/raw/*.parquet --contracts ESZ25 --start 2025-11-01 --end 2025-11-30
+PYTHONPATH=src python -m mdq.cli data/sample/dirty_futures_sample.csv --reconcile-against data/sample/dirty_futures_copy.csv
+PYTHONPATH=src python -m mdq.cli data/raw/*.parquet --vendor-daily data/daily/*.parquet --manifest data/manifest/files.csv
 ```
 
 Outputs: `dq_scorecard.csv`, `dq_issues.csv`, `rejected_records.csv`,
@@ -81,6 +87,7 @@ Outputs: `dq_scorecard.csv`, `dq_issues.csv`, `rejected_records.csv`,
 | `TIMESTAMP_INVALID` | ERROR / WARNING | Future-dated (error); Saturday (warning) |
 | `DATA_GAP` | WARNING | Missing in-session minutes ≥ threshold (default 30) |
 | `PRICE_OUTLIER` | WARNING | Extreme return vs recent behaviour; labelled if it reverses next bar |
+| `SCHEDULED_CLOSURE` | INFO | Gap overlapping an exchange holiday / early close: shown, not counted |
 
 **ERROR** records never reach analytics. **WARNING** records are kept but
 flagged, because removing real market moves (e.g. around an economic release)

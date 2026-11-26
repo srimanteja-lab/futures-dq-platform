@@ -88,5 +88,5 @@ def test_dashboard_renders_without_errors():
     at = AppTest.from_file(os.path.join(ROOT, "app", "dashboard.py"), default_timeout=120)
     at.run()
     assert not at.exception, at.exception
-    assert at.title[0].value.startswith("Futures Market Data Quality")
-    assert len(at.tabs) == 4
+    assert at.title[0].value == "Can I trust this data?"
+    assert len(at.tabs) == 5  # trust, analytics, reconciliation, insights, records

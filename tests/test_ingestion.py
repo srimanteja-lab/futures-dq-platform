@@ -6,9 +6,25 @@ import pytest
 from mdq.ingestion import SchemaError, ingest, normalise
 
 
-def _csv(text, name="t.csv"):
+def _csv(text, name="t.csv", max_malformed_pct=100.0):
+    # Row-level tests use tiny files that are mostly malformed on purpose, so
+    # the file-level rejection control is switched off unless a test sets it.
     buf = io.BytesIO(text.encode())
-    return ingest([buf], [name])
+    return ingest([buf], [name], max_malformed_pct=max_malformed_pct)
+
+
+def test_file_over_malformed_threshold_is_rejected_whole_and_accounted():
+    text = "Contract,Timestamp,Open,High,Low,Close,Volume\n" + "".join(
+        f"ES,{ts:%Y-%m-%d %H:%M},1,2,0.5,1,10\n"
+        for ts in pd.date_range("2025-11-10 09:00", periods=98, freq="1min")
+    ) + "ES,2025-11-10 11:00,abc,2,0.5,1,10\nES,bad,1,2,0.5,1,10\n"  # 2% malformed
+    r = _csv(text, max_malformed_pct=1.0)
+    assert r.file_checks.status.tolist() == ["Rejected"]
+    assert r.data.empty
+    assert (r.rejected.reason.str.startswith("FILE_REJECTED")).sum() == 98
+    assert r.total_rows == 100  # nothing silently dropped
+    ok = _csv(text, max_malformed_pct=5.0)
+    assert ok.file_checks.status.tolist() == ["Accepted"] and len(ok.data) == 98
 
 
 def test_maps_brief_column_names_and_types():

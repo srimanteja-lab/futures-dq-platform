@@ -25,6 +25,8 @@ flowchart LR
 | Ingestion | `ingestion.py` | Read, map, parse, quarantine malformed rows, lineage | Business rules |
 | Quality | `quality.py` | Rules → issues; build clean set; scorecard | File formats, UI |
 | Analytics | `analytics.py` | Pure functions on clean data | Where data came from |
+| Calendar | `exchange_calendar.py` | Exchange holidays and early closes | Rules, UI |
+| Reconciliation | `recon.py` | Manifest check, vendor daily recon, copy recon | How data was cleaned |
 | Insights | `insights.py` | Patterns + recommendations from issues | How issues were found |
 | Orchestration | `pipeline.py`, `cli.py` | Wire layers together | — |
 | Presentation | `app/dashboard.py` | Filters, charts, downloads, caching | Rule logic |

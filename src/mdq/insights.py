@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 from . import schema as S
-from .quality import ERROR, QualityReport
+from .quality import ERROR, INFO, QualityReport
 
 HIGH, MEDIUM, LOW = "High", "Medium", "Low"
 _PRIORITY_ORDER = {HIGH: 0, MEDIUM: 1, LOW: 2}
@@ -127,7 +127,9 @@ class RuleBasedInsights(InsightProvider):
             out.append(Insight(
                 "pattern", MEDIUM, f"{top} dominates the issue log",
                 f"{n:,} of {counts.sum():,} issues ({share:.0%}) are {top}.",
-                "Fixing this one root cause would remove most of the noise.", top,
+                ("Most gaps on thin or deferred contracts are no-trade minutes, not one root cause: "
+                 "use liquidity-aware thresholds so real outages stand out." if top == "DATA_GAP"
+                 else "Fixing this one root cause would remove most of the noise."), top,
             ))
         return out
 
@@ -224,7 +226,8 @@ class RuleBasedInsights(InsightProvider):
                     f"{avg_vol.get(c, 0):.1f} per bar - consistent with a thinly traded "
                     "(e.g. deferred) contract rather than missing data.",
                     "Use a liquidity-aware gap threshold for deferred months so "
-                    "real outages are not lost in noise.",
+                    "real outages are not lost in noise. Don't raise these with "
+                    "the vendor as a recurring defect.",
                     "DATA_GAP",
                 ))
         return out
@@ -274,9 +277,9 @@ class RuleBasedInsights(InsightProvider):
         )]
 
     # ------------------------------------------------------- recommendations
-    def _recommendations(self, report: QualityReport) -> List[Insight]:
+    def _recommendations(self, report: QualityReport, issues: pd.DataFrame = None) -> List[Insight]:
         out = []
-        issues = report.issues
+        issues = report.issues if issues is None else issues
         if issues.empty:
             return [Insight(
                 "recommendation", LOW, "No issues found",
@@ -302,18 +305,32 @@ class RuleBasedInsights(InsightProvider):
         return out
 
     def generate(self, report: QualityReport, data: pd.DataFrame) -> List[Insight]:
+        # INFO items (e.g. scheduled holiday closures) are context, not defects.
         issues = report.issues
+        if not issues.empty:
+            issues = issues[issues["severity"] != INFO]
         patterns: List[Insight] = []
+        illiquid = self._illiquidity(report, data)
+        lifecycle = self._lifecycle(issues, data) if not issues.empty else []
+        # Contracts whose gaps are already explained by thin trading or by
+        # being a deferred month: not a vendor defect.
+        illiquid_contracts = ({i.title.split(" ")[0] for i in illiquid}
+                              | {i.title.split(":")[0] for i in lifecycle})
         if not issues.empty:
             patterns += self._dominant_issue(issues)
             patterns += self._contract_concentration(issues, data)
-            patterns += self._recurring(issues, data)
+            # Don't tell Ops to chase the vendor for gaps that thin trading
+            # already explains (the two insights used to contradict each other).
+            patterns += [
+                i for i in self._recurring(issues, data)
+                if not (i.rule_id == "DATA_GAP" and i.title.split(" on ")[-1] in illiquid_contracts)
+            ]
             patterns += self._time_of_day(issues)
             patterns += self._simultaneous_gaps(issues, data)
             patterns += self._bad_ticks(issues)
-            patterns += self._lifecycle(issues, data)
-        patterns += self._illiquidity(report, data)
-        result = patterns + self._recommendations(report)
+            patterns += lifecycle
+        patterns += illiquid
+        result = patterns + self._recommendations(report, issues)
         return sorted(result, key=lambda i: (i.kind != "pattern", _PRIORITY_ORDER[i.priority]))
 
 

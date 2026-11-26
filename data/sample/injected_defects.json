@@ -1,0 +1,15 @@
+{
+  "DATA_GAP": {
+    "contract": "ESZ25",
+    "start": "2025-11-12 10:00",
+    "end": "2025-11-12 11:29"
+  },
+  "MISSING_VALUE": 8,
+  "OHLC_INCONSISTENT": 5,
+  "INVALID_PRICE": 3,
+  "INVALID_VOLUME": 2,
+  "PRICE_OUTLIER": 3,
+  "MALFORMED_RECORD": 6,
+  "DUPLICATE_EXACT": 15,
+  "DUPLICATE_CONFLICT": 4
+}
